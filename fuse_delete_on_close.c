@@ -7,7 +7,7 @@
 #include <errno.h>
 #include <malloc.h>
 #include <pthread.h>
-
+#include <signal.h>
 
 #ifndef min
 #  define min(a,b) (((a)<(b))?(a):(b))
@@ -25,6 +25,15 @@
 #include <fuse_lowlevel.h>
 #endif
 
+struct open_file {
+	char *name;
+   int references;
+	struct fuse_entry_param fep;
+   struct fuse_file_info ffi;
+   int handle;
+   struct open_file *next, **me;
+};
+
 static struct fuse_private_local
 {
 	struct fuse_chan* mount;
@@ -34,11 +43,64 @@ static struct fuse_private_local
 	pid_t myself;
 	uid_t uid;
 	gid_t gid;
-   pthread_t thread;
+	pthread_t thread;
+	fuse_ino_t current_ino;
+	struct open_file *files;
+   int pair[2];
 } fpl;
 
 static const char *doc_str = "Hello World!\n";
 static const char *doc_name = "hello";
+
+static struct open_file *getFile( const char *name ) {
+	struct open_file *file;
+	for( file = fpl.files; file; file = file->next ) {
+		if( strcmp( file->name, name ) == 0 )
+         break;
+	}
+	if( !file ) {
+		file = malloc( sizeof( struct open_file ) );
+      file->references = 1;
+		file->name = strdup( name );
+		file->fep.ino = fpl.current_ino++;
+      file->fep.generation = 1; // ino's are always unique.
+		file->fep.attr.st_dev = 0;
+		file->fep.attr.st_ino = file->fep.ino;
+		file->fep.attr.st_mode = S_IFREG;
+		file->fep.attr.st_nlink = 1;
+		file->fep.attr.st_uid = 0;
+		file->fep.attr.st_gid = 0;
+		file->fep.attr.st_rdev = 0;
+		file->fep.attr.st_size = 0;
+		file->fep.attr.st_atime = 0;
+		file->fep.attr.st_mtime = 0;
+		file->fep.attr.st_ctime = 0;
+		file->fep.attr.st_blksize = 4096;
+		file->fep.attr.st_blocks = 0;
+		file->fep.attr_timeout = 0;
+		file->fep.entry_timeout = 0;
+		file->ffi.flags = 0; // open/release flags
+		//file->ffi.writepage =
+		file->ffi.fh = -1;
+		file->ffi.direct_io = 1;
+		file->ffi.keep_cache = 0;
+		file->handle = -1;
+		if( file->next = fpl.files )
+			fpl.files->me = &file->next;
+      fpl.files = file;
+	}
+	else
+      file->references++;
+   return file;
+}
+
+static void closeFile( struct open_file *file ) {
+	file->references--;
+	if( !file->references ) {
+		file->me[0] = file->next;
+
+	}
+}
 
 static int doStat(fuse_ino_t ino, struct stat *attr, double *timeout)
 {
@@ -97,13 +159,15 @@ static void doc_ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
 	const struct fuse_ctx *ctx = fuse_req_ctx(req);
 	struct fuse_entry_param e;
-	fprintf( stderr, "lookup from %d  %d %ld %s", ctx->pid, fpl.myself, parent, name );
+	fprintf( stderr, "lookup from %d  %d %ld %s\n", ctx->pid, fpl.myself, parent, name );
 
 
-	if (parent != 1 || strcmp(name, doc_name) != 0)
+	if (parent != 1 || strcmp(name, doc_name) != 0) {
+      fprintf( stderr, "fail?\n" );
 		fuse_reply_err(req, ENOENT);
-	else {
+	} else {
 		double timeout;
+      fprintf( stderr, "ok?\n" );
 		memset(&e, 0, sizeof(e));
 		e.ino = 2;
 		doStat(e.ino, &e.attr, &timeout );
@@ -150,8 +214,6 @@ static void ll_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 	fuse_reply_open( req, fi );
 }
 
-
-
 static void doc_ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 					              off_t off, struct fuse_file_info *fi)
 {
@@ -188,10 +250,29 @@ static void ll_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 	fuse_reply_none( req );
 }
 
+static void doc_ll_create( fuse_req_t req
+								 , fuse_ino_t parent
+								 , const char*name, mode_t mode
+								 , struct fuse_file_info *fi)
+{
+	char buf[256];
+   struct open_file *file;
+	struct fuse_entry_param fep;
+	fprintf( stderr, "create a file:%s\n", name );
+	snprintf( buf, 256, "%s/%s", fpl.source_dir, name );
+   file = getFile( name );
+	file->handle = creat( buf, mode );
+	stat( buf, &file->fep.attr );
+   file->fep.attr.st_ino = file->fep.ino;
+   file->ffi.fh = file->handle;
+   fuse_reply_create( req, &file->fep, &file->ffi );
+}
+
 
 static void doc_ll_open(fuse_req_t req, fuse_ino_t ino,
 					           struct fuse_file_info *fi)
 {
+   fprintf( stderr, "open a file...%d", ino );
 	if (ino != 2)
 		fuse_reply_err(req, EISDIR);
 	else if ((fi->flags & 3) != O_RDONLY)
@@ -202,18 +283,37 @@ static void doc_ll_open(fuse_req_t req, fuse_ino_t ino,
 static void doc_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 					           off_t off, struct fuse_file_info *fi)
 {
-		  (void) fi;
-		  //assert(ino == 2);
-		  reply_buf_limited(req, doc_str, strlen(doc_str), off, size);
+   fprintf( stderr, "read called... %d %d\n", size, off );
+	(void) fi;
+	//assert(ino == 2);
+	reply_buf_limited(req, doc_str, strlen(doc_str), off, size);
 }
 
 
 static void ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size,
 					           off_t off, struct fuse_file_info *fi)
 {
-		  (void) fi;
-		  //assert(ino == 2);
-		  reply_buf_limited(req, doc_str, strlen(doc_str), off, size);
+	(void) fi;
+	//assert(ino == 2);
+	reply_buf_limited(req, doc_str, strlen(doc_str), off, size);
+}
+
+static void doc_ll_falloc( fuse_req_t req
+								 , fuse_ino_t ino
+								 , int mode
+								 , off_t offset
+								 , off_t length
+								 , struct fuse_file_info *fi)
+{
+	fprintf( stderr, "falloc....\n" );
+   //fuse_reply_err
+}
+
+static void doc_ll_bmap(fuse_req_t req, fuse_ino_t ino, size_t blocksize, uint64_t idx){
+
+   fprintf( stderr, "bmap? \n" );
+//   fuse_reply_bmap(req, 0);
+	fuse_reply_err( req, ENOSYS );
 }
 
 static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -235,6 +335,9 @@ static struct fuse_lowlevel_ops ll_oper = {
 		  .write          = ll_write,
 		  .opendir        = ll_opendir,
 		  .releasedir     = ll_releasedir,
+		  .create         = doc_ll_create,
+		  .fallocate      = doc_ll_falloc,
+        .bmap           = doc_ll_bmap,
 };
 
 static void fpvfs_close( void )
@@ -251,7 +354,7 @@ static void fpvfs_close( void )
 
 static void* sessionLoop( void* thread )
 {
-	fprintf( stderr, "thread as %d %d", getpid(), getpgrp() );
+	fprintf( stderr, "thread as %d %d\n", getpid(), getpgrp() );
 	if( fuse_set_signal_handlers( fpl.session ) != -1 ) {
 		int error;
 		fuse_session_add_chan( fpl.session, fpl.mount );
@@ -287,6 +390,12 @@ int fpvfs_init( const char * path, const char *source )
 
 }
 
+static void sigInt( int signal ) {
+   fprintf( stderr, "signal.\n" );
+	fpvfs_close();
+   write( fpl.pair[1], "G", 1 );
+}
+
 int main(int argc, char *argv[])
 {
 	char *mount;
@@ -298,12 +407,24 @@ int main(int argc, char *argv[])
 		store = argv[2];
    else store = "./test_storage";
 
-	fprintf( stderr, "Started as %d %d", getpid(), getpgrp() );
+   pipe( fpl.pair );
+	fpl.current_ino = 100;
+
+	fprintf( stderr, "Started as %d %d\n", getpid(), getpgrp() );
+	{
+		struct sigaction action;
+		action.sa_handler = sigInt;
+		sigemptyset(&action.sa_mask);
+		action.sa_flags = 0;
+
+		sigaction( SIGINT, &action, NULL );
+	}
 
 	fpvfs_init( mount, store );
 	while( fpl.mount )
 	{
-		usleep( 100000 );
+      char buf;
+      read( fpl.pair[0], &buf, 1 );
 	}
 	atexit( fpvfs_close );
 	return 0;
