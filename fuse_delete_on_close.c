@@ -20,16 +20,16 @@
 
 #include <fuse.h>
 #ifndef __ANDROID__
-#include <fuse/fuse_lowlevel.h>
+#include <fuse/fuse.h>
 #else
-#include <fuse_lowlevel.h>
+#include <fuse.h>
 #endif
 
 struct open_file {
 	char *name;
    int references;
-	struct fuse_entry_param fep;
-   struct fuse_file_info ffi;
+	//struct fuse_entry_param fep;
+   //struct fuse_file_info ffi;
    int handle;
    struct open_file *next, **me;
 };
@@ -44,13 +44,12 @@ static struct fuse_private_local
 	uid_t uid;
 	gid_t gid;
 	pthread_t thread;
-	fuse_ino_t current_ino;
+	int current_ino;
+   int current_handle;
 	struct open_file *files;
    int pair[2];
 } fpl;
 
-static const char *doc_str = "Hello World!\n";
-static const char *doc_name = "hello";
 
 static struct open_file *getFile( const char *name ) {
 	struct open_file *file;
@@ -62,6 +61,7 @@ static struct open_file *getFile( const char *name ) {
 		file = malloc( sizeof( struct open_file ) );
       file->references = 1;
 		file->name = strdup( name );
+      /*
 		file->fep.ino = fpl.current_ino++;
       file->fep.generation = 1; // ino's are always unique.
 		file->fep.attr.st_dev = 0;
@@ -84,6 +84,7 @@ static struct open_file *getFile( const char *name ) {
 		file->ffi.fh = -1;
 		file->ffi.direct_io = 1;
 		file->ffi.keep_cache = 0;
+      */
 		file->handle = -1;
 		if( file->next = fpl.files )
 			fpl.files->me = &file->next;
@@ -102,19 +103,19 @@ static void closeFile( struct open_file *file ) {
 	}
 }
 
-static int doStat(fuse_ino_t ino, struct stat *attr, double *timeout)
+static int doStat(uint64_t handle, struct stat *attr, double *timeout)
 {
-	fprintf( stderr, "request attr %ld", ino );
+	fprintf( stderr, "request attr %ld", handle );
 	memset( attr, 0, sizeof( *attr ) );
 	attr->st_dev = 1;
 	attr->st_nlink = 1;
-	attr->st_ino = ino;
+	attr->st_ino = 0; // needs to be filled in.
 	attr->st_uid = fpl.uid;
 	attr->st_gid = fpl.gid;
 	attr->st_size = 1234;
 	attr->st_blocks = 4321;
 	attr->st_blksize = 1;
-	if( ino == 1 ) {
+	if( handle == 1 ) {
 		attr->st_mode = S_IFDIR | 0700;
 		(*timeout) = 10000.0;
 	}
@@ -125,9 +126,21 @@ static int doStat(fuse_ino_t ino, struct stat *attr, double *timeout)
 	return 0;
 }
 
-static int doc_stat(fuse_ino_t ino, struct stat *stbuf)
+static int doc_stat(const char *file, struct statvfs *buf )
 {
-		  stbuf->st_ino = ino;
+	buf->f_bsize = 1;
+	buf->f_frsize = 1024;
+	buf->f_blocks = 1;
+	buf->f_bfree = 0;
+	buf->f_bavail = 0;
+	buf->f_files =0;
+	buf->f_ffree = 0;
+	buf->f_favail = 0;
+	buf->f_fsid = 0;
+	buf->f_flag = 0;
+   buf->f_namemax = 0;
+	fprintf( stderr, "doc_stat %s\n", file );
+   /*
 		  switch (ino) {
 		  case 1:
 					 stbuf->st_mode = S_IFDIR | 0755;
@@ -141,28 +154,31 @@ static int doc_stat(fuse_ino_t ino, struct stat *stbuf)
 		  default:
 					 return -1;
 		  }
+        */
 		  return 0;
 }
-static void doc_ll_getattr(fuse_req_t req, fuse_ino_t ino,
-                             struct fuse_file_info *fi)
+
+static void doc_getattr(const char *name, struct stat *stat, struct fuse_file_info *fi)
 {
 	struct stat stbuf;
 	double timeout;
 
-		  memset(&stbuf, 0, sizeof(stbuf));
-		  if (doStat(ino, &stbuf, &timeout) == -1)
-					 fuse_reply_err(req, ENOENT);
-		  else
-					 fuse_reply_attr(req, &stbuf, timeout);
+	memset(&stbuf, 0, sizeof(stbuf));
+	if (doStat(fi->fh, &stbuf, &timeout) == -1)
+		fuse_reply_err(req, ENOENT);
+	else
+		fuse_reply_attr(req, &stbuf, timeout);
 }
-static void doc_ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
+
+#if 0
+static void doc_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
 	const struct fuse_ctx *ctx = fuse_req_ctx(req);
 	struct fuse_entry_param e;
 	fprintf( stderr, "lookup from %d  %d %ld %s\n", ctx->pid, fpl.myself, parent, name );
 
 
-	if (parent != 1 || strcmp(name, doc_name) != 0) {
+	if (parent != 1 ) {
       fprintf( stderr, "fail?\n" );
 		fuse_reply_err(req, ENOENT);
 	} else {
@@ -176,6 +192,7 @@ static void doc_ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 		fuse_reply_entry(req, &e);
 	}
 }
+#endif
 struct dirbuf {
 		  char *p;
 		  size_t size;
@@ -207,14 +224,14 @@ static int reply_buf_limited(fuse_req_t req, const char *buf, size_t bufsize,
 }
 
 
-static void ll_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+static void doc_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	fi->fh = (uintptr_t)malloc( sizeof( struct dirbuf ) );
 	memset((void*)fi->fh, 0, sizeof(struct dirbuf));
 	fuse_reply_open( req, fi );
 }
 
-static void doc_ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
+static void doc_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 					              off_t off, struct fuse_file_info *fi)
 {
 	struct dirbuf *b = (struct dirbuf*)fi->fh;
@@ -244,15 +261,13 @@ static void doc_ll_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 		reply_buf_limited(req, b->p, b->size, off, size);
 	}
 }
-static void ll_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+static void doc_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	free( (void*)fi->fh );
 	fuse_reply_none( req );
 }
 
-static void doc_ll_create( fuse_req_t req
-								 , fuse_ino_t parent
-								 , const char*name, mode_t mode
+static void doc_create( const char*name, mode_t mode
 								 , struct fuse_file_info *fi)
 {
 	char buf[256];
@@ -269,7 +284,7 @@ static void doc_ll_create( fuse_req_t req
 }
 
 
-static void doc_ll_open(fuse_req_t req, fuse_ino_t ino,
+static void doc_open(fuse_req_t req, fuse_ino_t ino,
 					           struct fuse_file_info *fi)
 {
    fprintf( stderr, "open a file...%d", ino );
@@ -280,7 +295,7 @@ static void doc_ll_open(fuse_req_t req, fuse_ino_t ino,
 	else
 		fuse_reply_open(req, fi);
 }
-static void doc_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
+static void doc_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 					           off_t off, struct fuse_file_info *fi)
 {
    fprintf( stderr, "read called... %d %d\n", size, off );
@@ -290,7 +305,7 @@ static void doc_ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 }
 
 
-static void ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size,
+static void doc_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size,
 					           off_t off, struct fuse_file_info *fi)
 {
 	(void) fi;
@@ -298,7 +313,7 @@ static void ll_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
 	reply_buf_limited(req, doc_str, strlen(doc_str), off, size);
 }
 
-static void doc_ll_falloc( fuse_req_t req
+static void doc_falloc( fuse_req_t req
 								 , fuse_ino_t ino
 								 , int mode
 								 , off_t offset
@@ -309,35 +324,26 @@ static void doc_ll_falloc( fuse_req_t req
    //fuse_reply_err
 }
 
-static void doc_ll_bmap(fuse_req_t req, fuse_ino_t ino, size_t blocksize, uint64_t idx){
+static void doc_bmap(fuse_req_t req, fuse_ino_t ino, size_t blocksize, uint64_t idx){
 
    fprintf( stderr, "bmap? \n" );
 //   fuse_reply_bmap(req, 0);
 	fuse_reply_err( req, ENOSYS );
 }
 
-static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
-{
-	struct stat attr;
-	double timeout;
-	fprintf( stderr, "request attr %ld", ino );
-	doStat( ino, &attr, &timeout );
-	fuse_reply_attr( req, &attr, timeout );
-}
 
 
-static struct fuse_lowlevel_ops ll_oper = {
-		  .lookup         = doc_ll_lookup,
-		  .getattr        = ll_getattr,
-		  .readdir        = doc_ll_readdir,
-		  .open           = doc_ll_open,
-		  .read           = doc_ll_read,
-		  .write          = ll_write,
-		  .opendir        = ll_opendir,
-		  .releasedir     = ll_releasedir,
-		  .create         = doc_ll_create,
-		  .fallocate      = doc_ll_falloc,
-        .bmap           = doc_ll_bmap,
+static struct fuse_ops oper = {
+	.getattr        = doc_getattr,
+	.readdir        = doc_readdir,
+	.open           = doc_open,
+	.read           = doc_read,
+	.write          = doc_write,
+	.opendir        = doc_opendir,
+	.releasedir     = doc_releasedir,
+	.create         = doc_create,
+	.fallocate      = doc_falloc,
+	.bmap           = doc_bmap,
 };
 
 static void fpvfs_close( void )
